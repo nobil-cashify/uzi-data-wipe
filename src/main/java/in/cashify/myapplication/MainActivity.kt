@@ -194,10 +194,10 @@ class MainActivity : AppCompatActivity() {
             "model" to Build.MODEL,
             "device" to Build.DEVICE,
             "product" to Build.PRODUCT,
-            "android_version" to Build.VERSION.RELEASE,
+            "androidVersion" to Build.VERSION.RELEASE,
             "sdk" to Build.VERSION.SDK_INT,
-            "available_storage" to availableBytes,
-            "total_storage" to totalBytes,
+            "availableStorage" to availableBytes,
+            "totalStorage" to totalBytes,
         )
     }
 
@@ -356,7 +356,7 @@ class MainActivity : AppCompatActivity() {
                 Log.e("POLLING", "Error during polling: ${e.message}")
             }
 
-            delay(5000) // wait 5 seconds before polling again
+            delay(5000)
         }
     }
 
