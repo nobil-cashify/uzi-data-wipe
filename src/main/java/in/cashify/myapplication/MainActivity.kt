@@ -28,22 +28,26 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.IOException
+import java.io.InputStreamReader
 
 
 class MainActivity : AppCompatActivity() {
     private val REQUEST_CODE_STORAGE_PERMISSION = 100
-    private lateinit var outputTV: TextView
     private lateinit var button: Button
-    private lateinit var healthCheckButton: Button
+
+    private var availableStorage: Long = 0
+    private var totalStorage: Long = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        button = findViewById<Button>(R.id.sanitizeButton)
+
         checkStoragePermissions()
 
-        button = findViewById<Button>(R.id.sanitizeButton)
         button.setOnClickListener {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 if (Environment.isExternalStorageManager()) {
@@ -57,54 +61,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        healthCheckButton = findViewById<Button>(R.id.healthButton)
-        healthCheckButton.setOnClickListener {
-            runHealthCheck()
-        }
-
-        outputTV = findViewById<TextView>(R.id.outputTextView)
-
     }
-
-    private fun runHealthCheck() {
-        CoroutineScope(Dispatchers.IO).launch {
-            val scriptFile = File(filesDir, "health_check.sh")
-
-            try {
-                // Copy script from assets to internal storage
-                assets.open("health_check.sh").use { input ->
-                    FileOutputStream(scriptFile).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-
-                scriptFile.setExecutable(true)
-
-                // Run the script and capture output
-                val process = Runtime.getRuntime().exec(arrayOf("sh", scriptFile.absolutePath))
-
-                val output = process.inputStream.bufferedReader().readText().trim()
-                val error = process.errorStream.bufferedReader().readText().trim()
-                process.waitFor()
-                Log.d("TAG", "runHealthCheck: $error")
-                withContext(Dispatchers.Main) {
-                    if (error.isNotEmpty()) {
-                        Toast.makeText(this@MainActivity, "Error: $error", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(this@MainActivity, output, Toast.LENGTH_LONG).show()
-                        outputTV.text = output
-                    }
-                }
-
-            } catch (e: Exception) {
-                Log.e("HealthCheck", "Script failed", e)
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Exception: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    }
-
 
     private fun checkStoragePermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -147,12 +104,40 @@ class MainActivity : AppCompatActivity() {
         CoroutineScope(Dispatchers.IO).launch {
             val json = getDeviceMetadataJson()
             Log.d("METADATA", json)
-//            val file = saveJsonToFile(json, "device_metadata.json")
             sendMetadata(json)
+        }
+    }
 
-            //poll to run wiping shell
-//            pollToRunScript()
-//            runWipeScript()
+    fun sendMetadata(json: String) {
+        try {
+            val scriptFile = copyShellScriptToInternalStorage("send_metadata.sh")
+            val command = listOf("/system/bin/sh", scriptFile.absolutePath, json)
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val response = StringBuilder()
+            var line: String?
+
+            while (reader.readLine().also { line = it } != null) {
+                response.append(line)
+            }
+
+            process.waitFor()
+
+            val responseBody = response.toString()
+            Log.d("SHELL_API_CALL", "Response: $responseBody")
+            val jsonResponse = JSONObject(responseBody)
+            val deviceId = jsonResponse.getString("uuid")
+
+//            CoroutineScope(Dispatchers.IO).launch {
+//                runPollingConnectionScript(deviceId)
+//            }
+
+            CoroutineScope(Dispatchers.IO).launch {
+                pollToRunWipeScript(deviceId)
+            }
+        } catch (e: Exception) {
+            Log.e("API_CALL", "Exception in sendJsonToApi: ${e.message}", e)
         }
     }
 
@@ -168,7 +153,10 @@ class MainActivity : AppCompatActivity() {
 
             scriptFile.setExecutable(true)
 
-            val process = Runtime.getRuntime().exec(arrayOf("sh", scriptFile.absolutePath, deviceDiagnosisId))
+            val process = Runtime.getRuntime()
+                .exec(arrayOf("sh",
+                    scriptFile.absolutePath,
+                    deviceDiagnosisId))
 
             process.inputStream.bufferedReader().forEachLine {
                 Log.d("ScriptOutput", it)
@@ -186,9 +174,25 @@ class MainActivity : AppCompatActivity() {
 
     fun getDeviceMetadata(): Map<String, Any> {
         val stat = StatFs(Environment.getDataDirectory().path)
-        val availableBytes = stat.availableBytes
-        val totalBytes = stat.totalBytes
+        availableStorage = stat.availableBytes / 1073741824
+        totalStorage = stat.totalBytes / 1073741824
+
+        val username = try {
+            val file = File("/storage/emulated/0/user.json")
+            if (file.exists()) {
+                val jsonString = file.readText()
+                val jsonObject = JSONObject(jsonString)
+                jsonObject.getString("username")
+            } else {
+                "Unknown"
+            }
+        } catch (e: Exception) {
+            "Unknown"
+        }
+
         return mapOf(
+            "username" to username.toString(),
+            "deviceId" to Build.ID,
             "brand" to Build.BRAND,
             "manufacturer" to Build.MANUFACTURER,
             "model" to Build.MODEL,
@@ -196,8 +200,8 @@ class MainActivity : AppCompatActivity() {
             "product" to Build.PRODUCT,
             "androidVersion" to Build.VERSION.RELEASE,
             "sdk" to Build.VERSION.SDK_INT,
-            "availableStorage" to availableBytes,
-            "totalStorage" to totalBytes,
+            "availableStorageInGB" to availableStorage,
+            "totalStorageInGB" to totalStorage,
         )
     }
 
@@ -206,130 +210,42 @@ class MainActivity : AppCompatActivity() {
         return JSONObject(metadata).toString()
     }
 
-    fun saveJsonToFile(json: String, fileName: String): File {
-        val file = File(filesDir, fileName)
-        file.writeText(json)
-        return file
-    }
-
-    fun sendMetadata(json: String) {
+    fun runPollingConnectionScript(uuid: String) {
         try {
-            val client = OkHttpClient()
+            val scriptFile = copyShellScriptToInternalStorage("poll_status.sh")
+            val command = listOf("/system/bin/sh", scriptFile.absolutePath, uuid)
+            val process = ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
 
-            val requestBody = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), json)
-            val request = Request.Builder()
-                .url("http://192.168.1.162:8080/data-wipe/v1/device/register")
-//                .header("x-sso-token", "eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiMzFlN2I0MzctODcyNC00MzQ2LThiZGUtOGYzOGE5NWI0MDg0IiwiZXhwIjoxNzQ0NjU1Mzk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1NCJ9.V9c6g2IbNyGQ2JDX5W-i2jPEUi3V4Lf7QHOl5QX2KAE")
-                .post(requestBody)
-                .build()
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            var line: String?
 
-            Log.d("API_CALL", "About to enqueue request")
-
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    Log.e("API_CALL", "Failed: ${e.message}")
+            // Continuously read and log lines from the shell script
+            while (reader.readLine().also { line = it } != null) {
+                if (!line.isNullOrBlank()) {
+                    Log.d("POLLING_SCRIPT", line!!)
                 }
+            }
 
-                override fun onResponse(call: Call, response: Response) {
-                    response.use {
-                        if (!response.isSuccessful) {
-                            Log.e("API_CALL", "Unexpected code $response")
-                            return
-                        }
+            process.waitFor()
 
-                        val responseBody = response.body?.string()
-                        Log.d("API_CALL", "Response: $responseBody")
+            Log.d("POLLING_SCRIPT", "Polling script exited with code: ${process.exitValue()}")
 
-                        try {
-                            val jsonResponse = JSONObject(responseBody ?: "")
-                            val deviceId =
-                                jsonResponse.getInt("id")
-                            Log.d("API_CALL", "Device ID: $deviceId")
-
-                            val prefs = getSharedPreferences("MyPrefs", MODE_PRIVATE)
-                            prefs.edit().putInt("diagnosis_id", deviceId).apply()
-
-                            runOnUiThread {
-                                Toast.makeText(
-                                    this@MainActivity,
-                                    "Registered with ID: $deviceId",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                            }
-
-                            val registerDiagnosisJson = JSONObject(mapOf("deviceId" to deviceId)).toString();
-                            registerDiagnosis(registerDiagnosisJson);
-
-                        } catch (e: Exception) {
-                            Log.e("API_CALL", "Error parsing response: ${e.message}", e)
-                        }
-                    }
-                }
-            })
         } catch (e: Exception) {
-            Log.e("API_CALL", "Exception in sendJsonToApi: ${e.message}", e)
+            Log.e("POLLING_SCRIPT", "Exception: ${e.message}", e)
         }
     }
 
-    fun registerDiagnosis(registerJson: String) {
-        try {
-            val client = OkHttpClient()
-            val requestBody = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), registerJson)
-            val request = Request.Builder()
-                .url("http://192.168.1.162:8080/data-wipe/v1/diagnosis/register")
-//                .header("x-sso-token", "eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiMzFlN2I0MzctODcyNC00MzQ2LThiZGUtOGYzOGE5NWI0MDg0IiwiZXhwIjoxNzQ0NjU1Mzk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1NCJ9.V9c6g2IbNyGQ2JDX5W-i2jPEUi3V4Lf7QHOl5QX2KAE")
-                .post(requestBody)
-                .build()
-
-            Log.d("API_CALL", "About to enqueue request")
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    Log.e("API_CALL", "Failed: ${e.message}")
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    response.use {
-                        if (!response.isSuccessful) {
-                            Log.e("API_CALL", "Unexpected code $response")
-                            return
-                        }
-                        val responseBody = response.body?.string()
-                        Log.d("API_CALL", "Response: $responseBody")
-
-                        try {
-                            val jsonResponse = JSONObject(responseBody ?: "")
-                            val deviceDiagnosisId =
-                                jsonResponse.getInt("id")
-                            Log.d("API_CALL", "Diagnosis ID: $deviceDiagnosisId")
-
-                            val prefs = getSharedPreferences("MyPrefs", MODE_PRIVATE)
-                            prefs.edit().putInt("diagnosis_id", deviceDiagnosisId).apply()
-
-                            CoroutineScope(Dispatchers.IO).launch {
-                                pollToRunScript(deviceDiagnosisId)
-                            }
-
-
-                        } catch (e: Exception) {
-                            Log.e("API_CALL", "Error parsing response: ${e.message}", e)
-                        }
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            Log.e("API_CALL", "Exception in registerDiagnosis: ${e.message}", e)
-        }
-    }
-
-    suspend fun pollToRunScript(deviceDiagnosisId: Int) {
+    suspend fun pollToRunWipeScript(deviceId: String) {
         val client = OkHttpClient()
         var status = DiagnosisStatus.UNINITIATED
 
         while (status != DiagnosisStatus.INITIATED) {
             try {
                 val request = Request.Builder()
-                    .url("http://192.168.1.162:8080/data-wipe/v1/diagnosis/status/$deviceDiagnosisId")
-//                    .header("x-sso-token", "eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiMzFlN2I0MzctODcyNC00MzQ2LThiZGUtOGYzOGE5NWI0MDg0IiwiZXhwIjoxNzQ0NjU1Mzk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1NCJ9.V9c6g2IbNyGQ2JDX5W-i2jPEUi3V4Lf7QHOl5QX2KAE")
+                    .url("http://192.168.1.176:8080/data-wipe/v1/device/diagnosis/$deviceId")
+                    .header("x-sso-token", "eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiOTZlZDdjMjMtZjc2My00MTg4LWExZjMtYjYwNmNlY2E5ZmY5IiwiZXhwIjoxNzQ1MDAwOTk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1OCJ9.olaI3HjQ94q3kj60IuAMVM439Era5cg2PJmuDV2hZf8")
                     .get()
                     .build()
 
@@ -339,7 +255,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     val responseBody = response.body?.string()
                     val jsonResponse = JSONObject(responseBody ?: "")
-                    val statusString = jsonResponse.getString("status").uppercase()
+                    val statusString = jsonResponse.getString("status")
                     Log.d("POLLING", "Received status: $statusString")
                     status = DiagnosisStatus.valueOf(statusString)
 
@@ -347,7 +263,7 @@ class MainActivity : AppCompatActivity() {
                         Log.d("POLLING", "Initiated. Running script...")
                         withContext(Dispatchers.IO) {
                             Log.d("API_CALL", "pollToRunScript: RUNNING WIPE SCRIPT")
-                            runWipeScript(deviceDiagnosisId.toString())
+                            runWipeScript(deviceId)
                         }
                         break
                     }
@@ -360,8 +276,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    fun copyShellScriptToInternalStorage(filename: String): File {
+        val inputStream = assets.open(filename)
+        val file = File(filesDir, filename)
 
+        inputStream.use { input ->
+            FileOutputStream(file).use { output ->
+                input.copyTo(output)
+            }
+        }
 
+        file.setExecutable(true)
 
-
+        return file
+    }
 }

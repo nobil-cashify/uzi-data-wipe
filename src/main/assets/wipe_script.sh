@@ -5,6 +5,21 @@ JUNK_FILE_PREFIX=".wipe_fill"
 JUNK_BLOCK_SIZE_MB=100
 BLOCK_SIZE_BYTES=1048576
 DIAGNOSIS_ID=$1
+X_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $3 / 1024}')
+T_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $2 / 1024}')
+
+# Time Weights
+STEP1_WEIGHT=$((6 * X_UNIT))
+STEP2_WEIGHT=$((3 * T_UNIT))
+STEP3_WEIGHT=$((4 * T_UNIT))
+TOTAL_WEIGHT=$((STEP1_WEIGHT + STEP2_WEIGHT + STEP3_WEIGHT))
+
+# Progress Shares
+STEP1_SHARE=$((STEP1_WEIGHT * 100 / TOTAL_WEIGHT))
+STEP2_SHARE=$((STEP2_WEIGHT * 100 / TOTAL_WEIGHT))
+STEP3_SHARE=$((STEP3_WEIGHT * 100 / TOTAL_WEIGHT))
+
+is_step_three=0
 
 # Utility Functions:
 log() {
@@ -22,23 +37,23 @@ update_progress() {
   STATUS=$2
   PROGRESS=$3
 
-  JSON_PAYLOAD="{\"id\":\"$DIAGNOSIS_ID\",\"status\":\"$STATUS\",\"progressPercentage\":$PROGRESS}"
+  JSON_PAYLOAD="{\"uuid\":\"$DIAGNOSIS_ID\",\"status\":\"$STATUS\",\"progressPercentage\":$PROGRESS}"
 
-  echo "Sending update with payload: $JSON_PAYLOAD"
+#  echo "Sending update with payload: $JSON_PAYLOAD"
 
-  echo "testing curl: $(which curl)"
+#  echo "testing curl: $(which curl)"
 
-  RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X PUT "http://192.168.1.162:8080/data-wipe/v1/diagnosis/update" \
+  RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X PUT "http://192.168.1.176:8080/data-wipe/v1/device/diagnosis" \
     -H "Content-Type: application/json" \
-#    -H "x-sso-token: eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiMzFlN2I0MzctODcyNC00MzQ2LThiZGUtOGYzOGE5NWI0MDg0IiwiZXhwIjoxNzQ0NjU1Mzk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1NCJ9.V9c6g2IbNyGQ2JDX5W-i2jPEUi3V4Lf7QHOl5QX2KAE" \
+    -H "x-sso-token: eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiOTZlZDdjMjMtZjc2My00MTg4LWExZjMtYjYwNmNlY2E5ZmY5IiwiZXhwIjoxNzQ1MDAwOTk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1OCJ9.olaI3HjQ94q3kj60IuAMVM439Era5cg2PJmuDV2hZf8" \
     -d "$JSON_PAYLOAD")
 
   BODY=$(echo "$RESPONSE" | sed -e 's/HTTPSTATUS\:.*//g')
   STATUS_CODE=$(echo "$RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
 
-  echo "Response Body:"
-  echo "$BODY"
-  echo "Status Code: $STATUS_CODE"
+#  echo "Response Body:"
+#  echo "$BODY"
+#  echo "Status Code: $STATUS_CODE"
 }
 
 
@@ -64,9 +79,14 @@ overwrite_file() {
 # Steps:
 
 step_1_wipe() {
-  update_progress "$DIAGNOSIS_ID" "pending" "2"
+  update_progress "$DIAGNOSIS_ID" "PENDING" "2"
   log_title "STEP 1: Initial Wipe Pass"
   local start_time=$(date +%s)
+
+  files_list=$(find "$TARGET_DIR" -type f 2>/dev/null | grep -vE "$TARGET_DIR/Android/(data|obb)")
+  total_files=$(echo "$files_list" | wc -l)
+  local processed=0
+  local last_progress=0
 
   find "$TARGET_DIR" -type f 2>/dev/null | while read -r file; do
     case "$file" in
@@ -76,13 +96,20 @@ step_1_wipe() {
         is_step_three=0
         overwrite_file "$file"
         rm -f "$file"
+        processed=$((processed + 1))
+        progress=$((processed * STEP1_SHARE / total_files))
+        # call the below function only after set number of files if possible.
+        if [ "$progress" -ne "$last_progress" ]; then
+          update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+          last_progress=$progress
+        fi
         ;;
     esac
   done
 
   local end_time=$(date +%s)
   log "Step 1 completed in $((end_time - start_time)) seconds"
-  update_progress "$DIAGNOSIS_ID" "pending" "20"
+  update_progress "$DIAGNOSIS_ID" "PENDING" "20"
 }
 
 step_2_fill() {
@@ -94,24 +121,34 @@ step_2_fill() {
   mid_index=$((max_files / 2))
   start_last=$((max_files - 200))
   log "Estimated max filler files: $max_files"
+  local last_progress=0
 
   local i=0
   while true; do
     local file="$TARGET_DIR/$JUNK_FILE_PREFIX_$i.dat"
     dd if=/dev/zero of="$file" bs=1M count=$JUNK_BLOCK_SIZE_MB 2>/dev/null || break
     i=$((i + 1))
+    progress=$((STEP1_SHARE + (i * STEP2_SHARE / max_files)))  # Step 2 spans from 28% to 59%
+    if [ "$progress" -ne "$last_progress" ]; then
+      update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+      last_progress=$progress
+    fi
   done
 
   local end_time=$(date +%s)
   log "Step 2 completed in $((end_time - start_time)) seconds"
   log "Filled storage with $i junk files."
-  update_progress "$DIAGNOSIS_ID" "pending" "50"
+  update_progress "$DIAGNOSIS_ID" "PENDING" "50"
 }
 
 step_3_final_pass() {
   log_title "STEP 3: Final Wipe Pass"
   local start_time=$(date +%s)
   local counter=1
+
+  files_list=$(find "$TARGET_DIR" -type f 2>/dev/null | grep -vE "$TARGET_DIR/Android/(data|obb)")
+  total_files=$(echo "$files_list" | wc -l)
+  local last_progress=0
 
   find "$TARGET_DIR" -type f 2>/dev/null | while read -r file; do
     case "$file" in
@@ -133,6 +170,11 @@ step_3_final_pass() {
         fi
 
         counter=$((counter + 1))
+        progress=$((STEP1_SHARE + STEP2_SHARE + (counter * STEP3_SHARE / total_files)))  # Step 3: from 59% to 100%
+        if [ "$progress" -ne "$last_progress" ]; then
+          update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+          last_progress=$progress
+        fi
         rm -f "$file"
         ;;
     esac
@@ -140,7 +182,7 @@ step_3_final_pass() {
 
   local end_time=$(date +%s)
   log "Step 3 completed in $((end_time - start_time)) seconds"
-  update_progress "$DIAGNOSIS_ID" "completed" "100"
+  update_progress "$DIAGNOSIS_ID" "COMPLETED" "100"
 }
 
 main() {
