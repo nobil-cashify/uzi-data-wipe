@@ -1,5 +1,9 @@
 #!/system/bin/sh
 
+DIR=$(dirname "$0")
+. "$DIR/logger.sh"
+UPDATE_PROGRESS_PATH="$DIR/update_progress.sh"
+
 TARGET_DIR="/storage/emulated/0"
 JUNK_FILE_PREFIX=".wipe_fill"
 JUNK_BLOCK_SIZE_MB=1
@@ -9,55 +13,16 @@ ACCESS_TOKEN=$2
 X_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $3 / 1024}')
 T_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $2 / 1024}')
 
-# Time Weights
 STEP1_WEIGHT=$((6 * X_UNIT))
 STEP2_WEIGHT=$((3 * T_UNIT))
 STEP3_WEIGHT=$((4 * T_UNIT))
 TOTAL_WEIGHT=$((STEP1_WEIGHT + STEP2_WEIGHT + STEP3_WEIGHT))
 
-# Progress Shares
 STEP1_SHARE=$((STEP1_WEIGHT * 100 / TOTAL_WEIGHT))
 STEP2_SHARE=$((STEP2_WEIGHT * 100 / TOTAL_WEIGHT))
 STEP3_SHARE=$((STEP3_WEIGHT * 100 / TOTAL_WEIGHT))
 
 is_step_three=0
-
-# Utility Functions:
-log() {
-  echo "[*] $1"
-}
-
-log_title() {
-  echo ""
-  echo "========== $1 =========="
-}
-
-# Function to update progress
-update_progress() {
-  DIAGNOSIS_ID=$1
-  STATUS=$2
-  PROGRESS=$3
-
-  JSON_PAYLOAD="{\"uuid\":\"$DIAGNOSIS_ID\",\"status\":\"$STATUS\",\"progressPercentage\":$PROGRESS}"
-
-#  echo "Sending update with payload: $JSON_PAYLOAD"
-
-#  echo "testing curl: $(which curl)"
-
-  RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X PUT "https://data-wipe.api.stage.cashify.in:8443/v1/device/diagnosis" \
-    -H "Content-Type: application/json" \
-    -H "x-sso-token: $ACCESS_TOKEN" \
-    -d "$JSON_PAYLOAD")
-
-  BODY=$(echo "$RESPONSE" | sed -e 's/HTTPSTATUS\:.*//g')
-  STATUS_CODE=$(echo "$RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
-
-#  echo "Response Body:"
-#  echo "$BODY"
-#  echo "Status Code: $STATUS_CODE"
-}
-
-
 
 overwrite_file() {
   local file="$1"
@@ -73,14 +38,12 @@ overwrite_file() {
       dd if=/dev/urandom of="$file" bs=1M count="$block_count" conv=notrunc 2>/dev/null
     fi
   else
-    log "$file - File is empty or inaccessible."
+    log "WIPE SCRIPT: $file - File is empty or inaccessible."
   fi
 }
 
-# Steps:
-
 step_1_wipe() {
-  update_progress "$DIAGNOSIS_ID" "PENDING" "2"
+  sh "$UPDATE_PROGRESS_PATH" "$ACCESS_TOKEN" "$DIAGNOSIS_ID" "PENDING" "2"
   log_title "STEP 1: Initial Wipe Pass"
   local start_time=$(date +%s)
 
@@ -99,18 +62,15 @@ step_1_wipe() {
         rm -f "$file"
         processed=$((processed + 1))
         progress=$((processed * STEP1_SHARE / total_files))
-        # call the below function only after set number of files if possible.
-        if [ "$progress" -ge $((last_progress + 2)) ]; then
-          update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+        if [ "$progress" -ge $((last_progress + 5)) ]; then
+          sh "$UPDATE_PROGRESS_PATH" "$ACCESS_TOKEN" "$DIAGNOSIS_ID" "PENDING" "$progress"
           last_progress=$progress
         fi
         ;;
     esac
   done
 
-  local end_time=$(date +%s)
-  log "Step 1 completed in $((end_time - start_time)) seconds"
-  update_progress "$DIAGNOSIS_ID" "PENDING" "20"
+  benchmark_time "$start_time" "Step 1 completed"
 }
 
 step_2_fill() {
@@ -123,23 +83,21 @@ step_2_fill() {
   start_last=$((max_files - 200))
   log "Estimated max filler files: $max_files"
   local last_progress=0
-
   local i=0
+
   while true; do
     local file="$TARGET_DIR/$JUNK_FILE_PREFIX_$i.dat"
     dd if=/dev/zero of="$file" bs=100M count=$JUNK_BLOCK_SIZE_MB 2>/dev/null || break
     i=$((i + 1))
-    progress=$((STEP1_SHARE + (i * STEP2_SHARE / max_files)))  # Step 2 spans from 28% to 59%
-    if [ "$progress" -ge $((last_progress + 2)) ]; then
-      update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+    progress=$((STEP1_SHARE + (i * STEP2_SHARE / max_files)))
+    if [ "$progress" -ge $((last_progress + 5)) ]; then
+      sh "$UPDATE_PROGRESS_PATH" "$ACCESS_TOKEN" "$DIAGNOSIS_ID" "PENDING" "$progress"
       last_progress=$progress
     fi
   done
 
-  local end_time=$(date +%s)
-  log "Step 2 completed in $((end_time - start_time)) seconds"
+  benchmark_time "$start_time" "Step 2 completed"
   log "Filled storage with $i junk files."
-  update_progress "$DIAGNOSIS_ID" "PENDING" "50"
 }
 
 step_3_final_pass() {
@@ -160,20 +118,30 @@ step_3_final_pass() {
         is_step_three=1
         overwrite_file "$file"
 
-        if [ "$counter" -eq 1 ]; then
-          log "[BENCHMARK] First file overwritten"
-        elif [ "$counter" -eq 100 ]; then
-          log "[BENCHMARK] First 100 files overwritten"
-        elif [ "$counter" -eq "$mid_index" ]; then
-          log "[BENCHMARK] Midpoint file reached"
-        elif [ "$counter" -eq "$start_last" ]; then
-          log "[BENCHMARK] Last 200 files started"
-        fi
+        case "$counter" in
+          1)
+            benchmark_log "First file overwritten"
+            ;;
+          100)
+            benchmark_log "First 100 files overwritten: $(($(date +%s) - start_time))"
+            ;;
+          "$mid_index")
+            benchmark_log "Midpoint file reached"
+            mid_file_start_time=$(date +%s)
+            ;;
+          $((mid_index + 100)))
+            benchmark_log "Mid 100 files overwritten: $(($(date +%s) - mid_file_start_time))"
+            ;;
+          "$start_last")
+            benchmark_log "Last 200 files started"
+            end_file_start_time=$(date +%s)
+            ;;
+        esac
 
         counter=$((counter + 1))
-        progress=$((STEP1_SHARE + STEP2_SHARE + (counter * STEP3_SHARE / total_files)))  # Step 3: from 59% to 100%
-        if [ "$progress" -ge $((last_progress + 2)) ]; then
-          update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
+        progress=$((STEP1_SHARE + STEP2_SHARE + (counter * STEP3_SHARE / total_files)))
+        if [ "$progress" -ge $((last_progress + 5)) ]; then
+          sh "$UPDATE_PROGRESS_PATH" "$ACCESS_TOKEN" "$DIAGNOSIS_ID" "PENDING" "$progress"
           last_progress=$progress
         fi
         rm -f "$file"
@@ -181,9 +149,9 @@ step_3_final_pass() {
     esac
   done
 
-  local end_time=$(date +%s)
-  log "Step 3 completed in $((end_time - start_time)) seconds"
-  update_progress "$DIAGNOSIS_ID" "COMPLETED" "100"
+  benchmark_time "$end_file_start_time" "Last 200 files overwritten"
+  benchmark_time "$start_time" "Step 3 completed"
+  sh "$UPDATE_PROGRESS_PATH" "$ACCESS_TOKEN" "$DIAGNOSIS_ID" "COMPLETED" "100"
 }
 
 main() {
@@ -195,9 +163,8 @@ main() {
   step_2_fill
   step_3_final_pass
 
-  local script_end=$(date +%s)
+  benchmark_time "$script_start" "Total Time Taken"
   log_title "Script Completed"
-  log "Total Time Taken: $((script_end - script_start)) seconds"
 }
 
 main "$@"

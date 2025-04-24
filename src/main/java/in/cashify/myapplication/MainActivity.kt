@@ -17,6 +17,7 @@ import android.os.Environment
 import android.net.Uri
 import android.os.StatFs
 import android.provider.Settings
+import android.widget.TextView
 import `in`.cashify.myapplication.utils.DiagnosisStatus
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
@@ -28,8 +29,7 @@ import java.io.InputStreamReader
 
 class MainActivity : AppCompatActivity() {
     private val REQUEST_CODE_STORAGE_PERMISSION = 100
-    private lateinit var button: Button
-
+    private lateinit var tv: TextView;
     private var availableStorage: Long = 0
     private var totalStorage: Long = 0
 
@@ -37,21 +37,19 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        button = findViewById<Button>(R.id.sanitizeButton)
-
         checkStoragePermissions()
 
-        button.setOnClickListener {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                if (Environment.isExternalStorageManager()) {
-                    executeWipeScriptInBackground()
-                } else {
-                    Toast.makeText(this, "Please allow 'All files access' in settings.", Toast.LENGTH_LONG).show()
-                    checkStoragePermissions()
-                }
-            } else {
+        tv = findViewById<TextView>(R.id.uuid)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
                 executeWipeScriptInBackground()
+            } else {
+                Toast.makeText(this, "Please allow 'All files access' in settings.", Toast.LENGTH_LONG).show()
+                checkStoragePermissions()
             }
+        } else {
+            executeWipeScriptInBackground()
         }
 
     }
@@ -101,71 +99,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    fun sendMetadata(json: String) {
-        try {
-            val scriptFile = copyShellScriptToInternalStorage("send_metadata.sh")
-            val command = listOf("/system/bin/sh", scriptFile.absolutePath, json)
-            val process = ProcessBuilder(command).redirectErrorStream(true).start()
-
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val response = StringBuilder()
-            var line: String?
-
-            while (reader.readLine().also { line = it } != null) {
-                response.append(line)
-            }
-
-            process.waitFor()
-
-            val responseBody = response.toString()
-            Log.d("SHELL_API_CALL", "Response: $responseBody")
-            val jsonResponse = JSONObject(responseBody)
-            val deviceId = jsonResponse.getString("uuid")
-
-//            CoroutineScope(Dispatchers.IO).launch {
-//                runPollingConnectionScript(deviceId)
-//            }
-
-            CoroutineScope(Dispatchers.IO).launch {
-                pollToRunWipeScript(deviceId)
-            }
-        } catch (e: Exception) {
-            Log.e("API_CALL", "Exception in sendJsonToApi: ${e.message}", e)
-        }
-    }
-
-    private fun runWipeScript(deviceDiagnosisId: String, ssoToken: String) {
-        val scriptFile = File(filesDir, "wipe_script.sh")
-
-        try {
-            assets.open("wipe_script.sh").use { input ->
-                FileOutputStream(scriptFile).use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            scriptFile.setExecutable(true)
-
-            val process = Runtime.getRuntime()
-                .exec(arrayOf("sh",
-                    scriptFile.absolutePath,
-                    deviceDiagnosisId,
-                    ssoToken))
-
-            process.inputStream.bufferedReader().forEachLine {
-                Log.d("ScriptOutput", it)
-            }
-
-            process.errorStream.bufferedReader().forEachLine {
-                Log.e("ScriptError", it)
-            }
-
-            process.waitFor()
-        } catch (e: Exception) {
-            Log.e("ScriptRun", "Failed to execute script", e)
-        }
-    }
-
     fun getDeviceMetadata(): Map<String, Any> {
         val stat = StatFs(Environment.getDataDirectory().path)
         availableStorage = stat.availableBytes / 1073741824
@@ -204,9 +137,46 @@ class MainActivity : AppCompatActivity() {
         return JSONObject(metadata).toString()
     }
 
+    fun sendMetadata(json: String) {
+        try {
+            val scriptFile = copyShellScriptToInternalStorage("send_metadata.sh")
+            val command = listOf("/system/bin/sh", scriptFile.absolutePath, json)
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val response = StringBuilder()
+            var line: String?
+
+            while (reader.readLine().also { line = it } != null) {
+                response.append(line)
+            }
+
+            process.waitFor()
+
+            val responseBody = response.toString()
+            Log.d("SHELL_API_CALL", "Response: $responseBody")
+            val jsonResponse = JSONObject(responseBody)
+            val deviceId = jsonResponse.getString("uuid")
+
+//            CoroutineScope(Dispatchers.IO).launch {
+//                runPollingConnectionScript(deviceId)
+//            }
+
+            runOnUiThread {
+                tv.setText("UUID: $deviceId")
+            }
+
+            CoroutineScope(Dispatchers.IO).launch {
+                pollToRunWipeScript(deviceId)
+            }
+        } catch (e: Exception) {
+            Log.e("API_CALL", "Exception in sendJsonToApi: ${e.message}", e)
+        }
+    }
+
     fun runPollingConnectionScript(uuid: String) {
         try {
-            val scriptFile = copyShellScriptToInternalStorage("poll_status.sh")
+            val scriptFile = copyShellScriptToInternalStorage("poll_connection_status.sh")
             val command = listOf("/system/bin/sh", scriptFile.absolutePath, uuid)
             val process = ProcessBuilder(command)
                 .redirectErrorStream(true)
@@ -231,44 +201,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    suspend fun pollToRunWipeScript(deviceId: String) {
-        val client = OkHttpClient()
-        var status = DiagnosisStatus.REQUESTED
+    fun pollToRunWipeScript(uuid: String) {
+        try {
+            val scriptFile = copyShellScriptToInternalStorage("poll_diagnosis_status.sh")
 
-        while (status != DiagnosisStatus.INITIATED) {
-            try {
-                val request = Request.Builder()
-                    .url("https://data-wipe.api.stage.cashify.in:8443/v1/device/diagnose/$deviceId")
-                    .get()
-                    .build()
+            //registering auxiliary shell files
+            copyShellScriptToInternalStorage("wipe_script.sh")
+            copyShellScriptToInternalStorage("logger.sh")
+            copyShellScriptToInternalStorage("update_progress.sh")
 
-                val response = client.newCall(request).execute()
-                Log.d("poll", "pollToRunWipeScript: ${response.body}")
-                if (!response.isSuccessful) {
-                    Log.e("API_CALL", "Polling failed: ${response.code}")
-                } else {
-                    val responseBody = response.body?.string()
-                    val jsonResponse = JSONObject(responseBody ?: "")
-                    val statusString = jsonResponse.getString("status")
-                    val ssoToken = jsonResponse.getString("ssoToken")
-                    Log.d("POLLING", "Received status: $statusString")
-                    Log.d("POLLING", "Received sso token: $ssoToken")
-                    status = DiagnosisStatus.valueOf(statusString)
+            val command = listOf("/system/bin/sh", scriptFile.absolutePath, uuid)
+            val process = ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start()
 
-                    if (status == DiagnosisStatus.INITIATED) {
-                        Log.d("POLLING", "Initiated. Running script...")
-                        withContext(Dispatchers.IO) {
-                            Log.d("API_CALL", "pollToRunScript: RUNNING WIPE SCRIPT")
-                            runWipeScript(deviceId, ssoToken)
-                        }
-                        break
-                    }
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            var line: String?
+
+            // Continuously read and log lines from the shell script
+            while (reader.readLine().also { line = it } != null) {
+                if (!line.isNullOrBlank()) {
+                    Log.d("POLLING_SCRIPT", line!!)
                 }
-            } catch (e: Exception) {
-                Log.e("POLLING", "Error during polling: ${e.message}")
             }
 
-            delay(5000)
+            process.waitFor()
+
+            Log.d("POLLING_SCRIPT", "Polling script exited with code: ${process.exitValue()}")
+
+        } catch (e: Exception) {
+            Log.e("POLLING_SCRIPT", "Exception: ${e.message}", e)
         }
     }
 
