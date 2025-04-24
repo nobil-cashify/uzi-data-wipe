@@ -2,9 +2,10 @@
 
 TARGET_DIR="/storage/emulated/0"
 JUNK_FILE_PREFIX=".wipe_fill"
-JUNK_BLOCK_SIZE_MB=100
+JUNK_BLOCK_SIZE_MB=1
 BLOCK_SIZE_BYTES=1048576
 DIAGNOSIS_ID=$1
+ACCESS_TOKEN=$2
 X_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $3 / 1024}')
 T_UNIT=$(df /storage/emulated/0 | awk 'NR==2 {printf "%.0f\n", $2 / 1024}')
 
@@ -43,9 +44,9 @@ update_progress() {
 
 #  echo "testing curl: $(which curl)"
 
-  RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X PUT "http://192.168.1.176:8080/data-wipe/v1/device/diagnosis" \
+  RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X PUT "https://data-wipe.api.stage.cashify.in:8443/v1/device/diagnosis" \
     -H "Content-Type: application/json" \
-    -H "x-sso-token: eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiOTZlZDdjMjMtZjc2My00MTg4LWExZjMtYjYwNmNlY2E5ZmY5IiwiZXhwIjoxNzQ1MDAwOTk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1OCJ9.olaI3HjQ94q3kj60IuAMVM439Era5cg2PJmuDV2hZf8" \
+    -H "x-sso-token: $ACCESS_TOKEN" \
     -d "$JSON_PAYLOAD")
 
   BODY=$(echo "$RESPONSE" | sed -e 's/HTTPSTATUS\:.*//g')
@@ -99,7 +100,7 @@ step_1_wipe() {
         processed=$((processed + 1))
         progress=$((processed * STEP1_SHARE / total_files))
         # call the below function only after set number of files if possible.
-        if [ "$progress" -ne "$last_progress" ]; then
+        if [ "$progress" -ge $((last_progress + 2)) ]; then
           update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
           last_progress=$progress
         fi
@@ -126,10 +127,10 @@ step_2_fill() {
   local i=0
   while true; do
     local file="$TARGET_DIR/$JUNK_FILE_PREFIX_$i.dat"
-    dd if=/dev/zero of="$file" bs=1M count=$JUNK_BLOCK_SIZE_MB 2>/dev/null || break
+    dd if=/dev/zero of="$file" bs=100M count=$JUNK_BLOCK_SIZE_MB 2>/dev/null || break
     i=$((i + 1))
     progress=$((STEP1_SHARE + (i * STEP2_SHARE / max_files)))  # Step 2 spans from 28% to 59%
-    if [ "$progress" -ne "$last_progress" ]; then
+    if [ "$progress" -ge $((last_progress + 2)) ]; then
       update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
       last_progress=$progress
     fi
@@ -171,7 +172,7 @@ step_3_final_pass() {
 
         counter=$((counter + 1))
         progress=$((STEP1_SHARE + STEP2_SHARE + (counter * STEP3_SHARE / total_files)))  # Step 3: from 59% to 100%
-        if [ "$progress" -ne "$last_progress" ]; then
+        if [ "$progress" -ge $((last_progress + 2)) ]; then
           update_progress "$DIAGNOSIS_ID" "PENDING" "$progress"
           last_progress=$progress
         fi

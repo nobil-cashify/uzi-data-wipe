@@ -1,7 +1,7 @@
 package in.cashify.myapplication.utils;
 
 public enum DiagnosisStatus {
-    UNINITIATED,
+    REQUESTED,
     INITIATED,
     PENDING,
     COMPLETED;

@@ -17,19 +17,12 @@ import android.os.Environment
 import android.net.Uri
 import android.os.StatFs
 import android.provider.Settings
-import android.widget.TextView
 import `in`.cashify.myapplication.utils.DiagnosisStatus
 import kotlinx.coroutines.*
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.Response
 import org.json.JSONObject
 import java.io.BufferedReader
-import java.io.IOException
 import java.io.InputStreamReader
 
 
@@ -141,7 +134,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runWipeScript(deviceDiagnosisId: String) {
+    private fun runWipeScript(deviceDiagnosisId: String, ssoToken: String) {
         val scriptFile = File(filesDir, "wipe_script.sh")
 
         try {
@@ -156,7 +149,8 @@ class MainActivity : AppCompatActivity() {
             val process = Runtime.getRuntime()
                 .exec(arrayOf("sh",
                     scriptFile.absolutePath,
-                    deviceDiagnosisId))
+                    deviceDiagnosisId,
+                    ssoToken))
 
             process.inputStream.bufferedReader().forEachLine {
                 Log.d("ScriptOutput", it)
@@ -239,31 +233,33 @@ class MainActivity : AppCompatActivity() {
 
     suspend fun pollToRunWipeScript(deviceId: String) {
         val client = OkHttpClient()
-        var status = DiagnosisStatus.UNINITIATED
+        var status = DiagnosisStatus.REQUESTED
 
         while (status != DiagnosisStatus.INITIATED) {
             try {
                 val request = Request.Builder()
-                    .url("http://192.168.1.176:8080/data-wipe/v1/device/diagnosis/$deviceId")
-                    .header("x-sso-token", "eyJhbGciOiJIUzI1NiJ9.eyJjVGlkIjoiOTZlZDdjMjMtZjc2My00MTg4LWExZjMtYjYwNmNlY2E5ZmY5IiwiZXhwIjoxNzQ1MDAwOTk5LCJndCI6ImNvbnNvbGUiLCJ2dCI6MCwia2lkIjoiNDY1OCJ9.olaI3HjQ94q3kj60IuAMVM439Era5cg2PJmuDV2hZf8")
+                    .url("https://data-wipe.api.stage.cashify.in:8443/v1/device/diagnose/$deviceId")
                     .get()
                     .build()
 
                 val response = client.newCall(request).execute()
+                Log.d("poll", "pollToRunWipeScript: ${response.body}")
                 if (!response.isSuccessful) {
                     Log.e("API_CALL", "Polling failed: ${response.code}")
                 } else {
                     val responseBody = response.body?.string()
                     val jsonResponse = JSONObject(responseBody ?: "")
                     val statusString = jsonResponse.getString("status")
+                    val ssoToken = jsonResponse.getString("ssoToken")
                     Log.d("POLLING", "Received status: $statusString")
+                    Log.d("POLLING", "Received sso token: $ssoToken")
                     status = DiagnosisStatus.valueOf(statusString)
 
                     if (status == DiagnosisStatus.INITIATED) {
                         Log.d("POLLING", "Initiated. Running script...")
                         withContext(Dispatchers.IO) {
                             Log.d("API_CALL", "pollToRunScript: RUNNING WIPE SCRIPT")
-                            runWipeScript(deviceId)
+                            runWipeScript(deviceId, ssoToken)
                         }
                         break
                     }
